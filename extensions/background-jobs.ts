@@ -308,6 +308,19 @@ function getJobSummary(job: JobRecord, maxChars = 1200) {
   return truncateText(source.trim(), maxChars);
 }
 
+function readFullJobOutput(job: JobRecord) {
+  if (job.outputPath && existsSync(job.outputPath)) return readFileSync(job.outputPath, "utf8").trimEnd();
+  if (job.lastResult) return job.lastResult.trimEnd();
+  if (job.lastError) return job.lastError.trimEnd();
+  if (job.logPath && existsSync(job.logPath)) return readFileSync(job.logPath, "utf8").trimEnd();
+  return "(no output)";
+}
+
+function renderKeyValue(theme: ExtensionContext["ui"]["theme"], key: string, value: string | undefined) {
+  if (!value) return undefined;
+  return `${theme.fg("muted", `${key}:`)} ${value}`;
+}
+
 function buildTaskNotificationContent(job: JobRecord) {
   const summary = getJobSummary(job, 2000);
   const action = job.kind === "subagent" ? job.prompt : job.command;
@@ -327,7 +340,7 @@ function buildTaskNotificationContent(job: JobRecord) {
 }
 
 function renderTaskNotification(job: JobRecord, expanded: boolean, theme: ExtensionContext["ui"]["theme"]) {
-  const summary = getJobSummary(job, expanded ? 4000 : 220);
+  const summary = getJobSummary(job, 220);
   const actionLabel = job.kind === "subagent" ? "Prompt" : "Command";
   const action = job.kind === "subagent" ? job.prompt : job.command;
 
@@ -336,15 +349,19 @@ function renderTaskNotification(job: JobRecord, expanded: boolean, theme: Extens
     return `${formatJobLineStyled(job, theme)}${suffix}`;
   }
 
+  const output = readFullJobOutput(job);
   const lines = [
     formatJobLineStyled(job, theme),
-    action ? `${theme.fg("muted", `${actionLabel}:`)} ${action}` : undefined,
-    job.piSessionId ? `${theme.fg("muted", "Session:")} ${job.piSessionId}` : undefined,
-    `${theme.fg("muted", "Full output:")} ${job.outputPath}`,
-    `${theme.fg("muted", "Log:")} ${job.logPath}`,
+    renderKeyValue(theme, actionLabel, action),
+    renderKeyValue(theme, "Agent", job.agent),
+    renderKeyValue(theme, "Model", job.model),
+    renderKeyValue(theme, "Thinking", job.thinking),
+    renderKeyValue(theme, "Session", job.piSessionId),
+    renderKeyValue(theme, "Full output", job.outputPath),
+    renderKeyValue(theme, "Log", job.logPath),
     "",
-    theme.fg("muted", "Summary / tail:"),
-    summary,
+    theme.fg("muted", "Full output:"),
+    output,
   ].filter((line): line is string => line !== undefined);
   return lines.join("\n");
 }
@@ -724,13 +741,31 @@ export default function (pi: ExtensionAPI) {
       const job = startBashJob(registry, ctx, params.command, cwd, params.name);
       return { content: [{ type: "text", text: `Started ${job.id} pid:${job.pid ?? "pending"}\nLog: ${job.logPath}` }], details: job };
     },
-    renderCall(args, theme) {
-      return new Text(`${theme.fg("toolTitle", theme.bold("background_bash"))} ${theme.fg("dim", oneLine(args.command, 120))}`, 0, 0);
+    renderCall(args, theme, context) {
+      const lines = [`${theme.fg("toolTitle", theme.bold("background_bash"))} ${theme.fg("dim", oneLine(args.command, 120))}`];
+      if (context.expanded) {
+        lines.push(
+          renderKeyValue(theme, "Command", args.command)!,
+          renderKeyValue(theme, "Cwd", args.cwd) ?? theme.fg("dim", "Cwd: current project"),
+        );
+      }
+      return new Text(lines.join("\n"), 0, 0);
     },
-    renderResult(result, _options, theme) {
+    renderResult(result, options, theme) {
       const job = isJobRecord(result.details) ? result.details : undefined;
       if (!job) return new Text(result.content[0]?.type === "text" ? result.content[0].text : "Started background job", 0, 0);
-      return new Text(`${formatJobLineStyled(job, theme)}\n${theme.fg("dim", `Full output: ${job.outputPath}`)}`, 0, 0);
+      if (!options.expanded) return new Text(`${formatJobLineStyled(job, theme)}\n${theme.fg("dim", `Full output: ${job.outputPath}`)}`, 0, 0);
+      return new Text(
+        [
+          formatJobLineStyled(job, theme),
+          renderKeyValue(theme, "Command", job.command),
+          renderKeyValue(theme, "Cwd", job.cwd),
+          renderKeyValue(theme, "Full output", job.outputPath),
+          renderKeyValue(theme, "Log", job.logPath),
+        ].filter((line): line is string => line !== undefined).join("\n"),
+        0,
+        0,
+      );
     },
   });
 
@@ -769,19 +804,50 @@ export default function (pi: ExtensionAPI) {
       }
       return { content: [{ type: "text", text: `Started subagent ${job.id} pid:${job.pid ?? "pending"}\nUse job_status/job_output/job_stop with id ${job.id}.` }], details: job };
     },
-    renderCall(args, theme) {
+    renderCall(args, theme, context) {
       const agent = args.agent ?? "general";
       const mode = args.wait ? "foreground" : "background";
+      const lines: Array<string | undefined> = [
+        `${theme.fg("toolTitle", theme.bold("subagent_start"))} ${theme.fg("warning", agent)} ${theme.fg("dim", `(${mode})`)}`,
+        theme.fg("dim", oneLine(args.prompt, 180)),
+      ];
+      if (context.expanded) {
+        lines.push(
+          "",
+          renderKeyValue(theme, "Agent", agent),
+          renderKeyValue(theme, "Mode", mode),
+          renderKeyValue(theme, "Model", args.model),
+          renderKeyValue(theme, "Thinking", args.thinking),
+          renderKeyValue(theme, "Tools", Array.isArray(args.tools) ? args.tools.join(",") : undefined),
+          renderKeyValue(theme, "Cwd", args.cwd) ?? theme.fg("dim", "Cwd: current project"),
+          "",
+          theme.fg("muted", "Full prompt:"),
+          args.prompt,
+        );
+      }
+      return new Text(lines.filter((line): line is string => line !== undefined).join("\n"), 0, 0);
+    },
+    renderResult(result, options, theme) {
+      const job = isJobRecord(result.details) ? result.details : undefined;
+      if (!job) return new Text(result.content[0]?.type === "text" ? result.content[0].text : "Started subagent", 0, 0);
+      if (!options.expanded) return new Text(`${formatJobLineStyled(job, theme)}\n${theme.fg("dim", `Prompt: ${oneLine(job.prompt ?? "", 180)}`)}`, 0, 0);
       return new Text(
-        `${theme.fg("toolTitle", theme.bold("subagent_start"))} ${theme.fg("warning", agent)} ${theme.fg("dim", `(${mode})`)}\n${theme.fg("dim", oneLine(args.prompt, 180))}`,
+        [
+          formatJobLineStyled(job, theme),
+          renderKeyValue(theme, "Agent", job.agent),
+          renderKeyValue(theme, "Model", job.model),
+          renderKeyValue(theme, "Thinking", job.thinking),
+          renderKeyValue(theme, "Tools", job.tools?.join(",")),
+          renderKeyValue(theme, "Cwd", job.cwd),
+          renderKeyValue(theme, "Full output", job.outputPath),
+          renderKeyValue(theme, "Log", job.logPath),
+          "",
+          theme.fg("muted", "Full prompt:"),
+          job.prompt ?? "",
+        ].filter((line): line is string => line !== undefined).join("\n"),
         0,
         0,
       );
-    },
-    renderResult(result, _options, theme) {
-      const job = isJobRecord(result.details) ? result.details : undefined;
-      if (!job) return new Text(result.content[0]?.type === "text" ? result.content[0].text : "Started subagent", 0, 0);
-      return new Text(`${formatJobLineStyled(job, theme)}\n${theme.fg("dim", `Prompt: ${oneLine(job.prompt ?? "", 180)}`)}`, 0, 0);
     },
   });
 
