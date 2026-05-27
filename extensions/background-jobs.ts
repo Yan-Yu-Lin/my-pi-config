@@ -27,6 +27,7 @@ type JobRecord = {
   createdAt: number;
   updatedAt: number;
   logPath: string;
+  outputPath: string;
   command?: string;
   agent?: string;
   agentSource?: JobSource;
@@ -47,6 +48,7 @@ type Registry = {
   workspaceId: string;
   workspaceDir: string;
   logDir: string;
+  outputDir: string;
   registryPath: string;
   subagentSessionDir: string;
 };
@@ -92,13 +94,15 @@ function registryPaths(workspaceId: string) {
     workspaceId: sanitizeWorkspaceId(workspaceId),
     workspaceDir,
     logDir: join(workspaceDir, "logs"),
+    outputDir: join(workspaceDir, "outputs"),
     registryPath: join(workspaceDir, "registry.json"),
     subagentSessionDir: join(workspaceDir, "subagent-sessions"),
   };
 }
 
-function ensureDirs(registry: Pick<Registry, "logDir" | "subagentSessionDir">) {
+function ensureDirs(registry: Pick<Registry, "logDir" | "outputDir" | "subagentSessionDir">) {
   mkdirSync(registry.logDir, { recursive: true });
+  mkdirSync(registry.outputDir, { recursive: true });
   mkdirSync(registry.subagentSessionDir, { recursive: true });
 }
 
@@ -112,6 +116,15 @@ function isRecord(value: unknown): value is JsonRecord {
 
 function asString(value: unknown) {
   return typeof value === "string" ? value : undefined;
+}
+
+function messageContentText(content: unknown) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => (isRecord(part) && part.type === "text" && typeof part.text === "string" ? part.text : ""))
+    .filter(Boolean)
+    .join("\n");
 }
 
 function normalizeTools(tools: string[] | undefined) {
@@ -131,7 +144,12 @@ function loadRegistry(workspaceId: string): Registry {
   try {
     const parsed = JSON.parse(readFileSync(registry.registryPath, "utf8")) as Partial<Pick<Registry, "next" | "jobs">>;
     registry.next = { sh: parsed.next?.sh ?? 1, sa: parsed.next?.sa ?? 1 };
-    registry.jobs = Array.isArray(parsed.jobs) ? parsed.jobs : [];
+    registry.jobs = Array.isArray(parsed.jobs)
+      ? parsed.jobs.map((job) => ({
+          ...job,
+          outputPath: job.outputPath ?? (job.kind === "bash" ? job.logPath : join(registry.outputDir, `${job.id}.md`)),
+        }))
+      : [];
     return registry;
   } catch {
     return registry;
@@ -149,6 +167,7 @@ function createJob(registry: Registry, kind: JobKind, cwd: string): JobRecord {
   registry.next[prefix] = count + 1;
   const id = `${prefix}_${String(count).padStart(3, "0")}`;
   const createdAt = now();
+  const logPath = join(registry.logDir, `${id}.log`);
   const job: JobRecord = {
     id,
     kind,
@@ -156,7 +175,8 @@ function createJob(registry: Registry, kind: JobKind, cwd: string): JobRecord {
     cwd,
     createdAt,
     updatedAt: createdAt,
-    logPath: join(registry.logDir, `${id}.log`),
+    logPath,
+    outputPath: kind === "bash" ? logPath : join(registry.outputDir, `${id}.md`),
   };
   registry.jobs.push(job);
   saveRegistry(registry);
@@ -253,6 +273,80 @@ async function tailFile(path: string, maxLines: number) {
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
   }
+}
+
+function tailFileSync(path: string, maxLines: number) {
+  try {
+    const text = readFileSync(path, "utf8");
+    const lines = text.split(/\r?\n/);
+    return lines.slice(Math.max(0, lines.length - maxLines)).join("\n").trimEnd();
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+function truncateText(text: string, maxChars: number) {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars).trimEnd()}…`;
+}
+
+function oneLine(text: string, maxChars: number) {
+  return truncateText(text.replace(/\s+/g, " ").trim(), maxChars);
+}
+
+function xmlEscape(text: string) {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function getJobSummary(job: JobRecord, maxChars = 1200) {
+  const source = job.lastResult || job.lastError || tailFileSync(job.logPath, 20) || "(no output)";
+  return truncateText(source.trim(), maxChars);
+}
+
+function buildTaskNotificationContent(job: JobRecord) {
+  const summary = getJobSummary(job, 2000);
+  const action = job.kind === "subagent" ? job.prompt : job.command;
+  return [
+    "<task-notification>",
+    `  <job-id>${xmlEscape(job.id)}</job-id>`,
+    `  <kind>${xmlEscape(job.kind)}</kind>`,
+    `  <status>${xmlEscape(job.status)}</status>`,
+    job.agent ? `  <agent>${xmlEscape(job.agent)}</agent>` : undefined,
+    job.piSessionId ? `  <session-id>${xmlEscape(job.piSessionId)}</session-id>` : undefined,
+    action ? `  <task>${xmlEscape(action)}</task>` : undefined,
+    `  <summary>${xmlEscape(summary)}</summary>`,
+    `  <output-path>${xmlEscape(job.outputPath)}</output-path>`,
+    `  <log-path>${xmlEscape(job.logPath)}</log-path>`,
+    "</task-notification>",
+  ].filter(Boolean).join("\n");
+}
+
+function renderTaskNotification(job: JobRecord, expanded: boolean, theme: ExtensionContext["ui"]["theme"]) {
+  const summary = getJobSummary(job, expanded ? 4000 : 220);
+  const actionLabel = job.kind === "subagent" ? "Prompt" : "Command";
+  const action = job.kind === "subagent" ? job.prompt : job.command;
+
+  if (!expanded) {
+    const suffix = summary ? theme.fg("dim", ` — ${oneLine(summary, 180)}`) : "";
+    return `${formatJobLineStyled(job, theme)}${suffix}`;
+  }
+
+  const lines = [
+    formatJobLineStyled(job, theme),
+    action ? `${theme.fg("muted", `${actionLabel}:`)} ${action}` : undefined,
+    job.piSessionId ? `${theme.fg("muted", "Session:")} ${job.piSessionId}` : undefined,
+    `${theme.fg("muted", "Full output:")} ${job.outputPath}`,
+    `${theme.fg("muted", "Log:")} ${job.logPath}`,
+    "",
+    theme.fg("muted", "Summary / tail:"),
+    summary,
+  ].filter((line): line is string => line !== undefined);
+  return lines.join("\n");
 }
 
 function parseToolList(value: unknown) {
@@ -361,7 +455,7 @@ function startBashJob(
     env: process.env,
     stdio: ["ignore", "pipe", "pipe"],
   });
-  bindChild(registry, ctx, job, child, false);
+  bindChild(registry, ctx, job, child, true);
   return job;
 }
 
@@ -388,6 +482,7 @@ function bindChild(
       pid: undefined,
       exitCode: code ?? undefined,
       lastError: status === "error" ? `Process exited with code ${code}` : undefined,
+      outputPath: job.logPath,
     });
     updateWidget(ctx, registry);
     if (reportCompletion && current) reportJobCompletion(current);
@@ -522,7 +617,11 @@ function bindJsonSubagent(
 
     if (event.type === "agent_end") {
       finalText = extractFinalAssistantText(event) ?? finalText;
-      if (finalText) updateJob(registry, job.id, { lastResult: finalText });
+      if (finalText) {
+        mkdirSync(dirname(job.outputPath), { recursive: true });
+        writeFileSync(job.outputPath, `${finalText}\n`, "utf8");
+        updateJob(registry, job.id, { lastResult: finalText, outputPath: job.outputPath });
+      }
     }
   };
 
@@ -547,6 +646,7 @@ function bindJsonSubagent(
       pid: undefined,
       exitCode: code ?? undefined,
       lastResult: finalText || job.lastResult,
+      outputPath: job.outputPath,
       lastError: status === "error" ? stderr.trim() || `Subagent exited with code ${code}` : undefined,
     });
     updateWidget(ctx, registry);
@@ -570,9 +670,8 @@ async function stopJob(registry: Registry, idOrPid: string, force: boolean) {
 
 function renderJobMessage(job: JobRecord) {
   const header = `${formatJobLine(job)}\n`;
-  if (job.lastResult) return `${header}\n${job.lastResult}`;
-  if (job.lastError) return `${header}\nError: ${job.lastError}`;
-  return header;
+  const summary = getJobSummary(job, 4000);
+  return `${header}\n${summary}\n\nFull output: ${job.outputPath}\nLog: ${job.logPath}`;
 }
 
 const ThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const);
@@ -583,23 +682,19 @@ export default function (pi: ExtensionAPI) {
   let latestCtx: ExtensionContext | undefined;
 
   reportJobCompletion = (job) => {
-    if (!latestCtx?.hasUI) return;
-    latestCtx.ui.notify(`${job.id} ${job.status}`, job.status === "done" ? "info" : "warning");
+    if (latestCtx?.hasUI) latestCtx.ui.notify(`${job.id} ${job.status}`, job.status === "done" ? "info" : "warning");
     pi.sendMessage({
-      customType: "background-job",
-      content: renderJobMessage(job),
+      customType: "task-notification",
+      content: buildTaskNotificationContent(job),
       display: true,
       details: job,
-    }, { deliverAs: "followUp" });
+    }, { deliverAs: "followUp", triggerTurn: true });
   };
 
-  pi.registerMessageRenderer("background-job", (message, _options, theme) => {
+  pi.registerMessageRenderer("task-notification", (message, options, theme) => {
     const job = isJobRecord(message.details) ? message.details : undefined;
-    const title = theme.fg("warning", theme.bold("Background job update"));
-    if (!job) return new Text(`${title}\n${message.content}`, 0, 0);
-
-    const body = job.lastResult ? `\n\n${job.lastResult}` : job.lastError ? `\n\n${theme.fg("error", job.lastError)}` : "";
-    return new Text(`${title}\n${formatJobLineStyled(job, theme)}${body}`, 0, 0);
+    if (!job) return new Text(messageContentText(message.content), 0, 0);
+    return new Text(renderTaskNotification(job, options.expanded, theme), 0, 0);
   });
 
   pi.on("session_start", (_event, ctx) => {
@@ -628,6 +723,14 @@ export default function (pi: ExtensionAPI) {
       const cwd = params.cwd ? resolve(ctx.cwd, params.cwd) : ctx.cwd;
       const job = startBashJob(registry, ctx, params.command, cwd, params.name);
       return { content: [{ type: "text", text: `Started ${job.id} pid:${job.pid ?? "pending"}\nLog: ${job.logPath}` }], details: job };
+    },
+    renderCall(args, theme) {
+      return new Text(`${theme.fg("toolTitle", theme.bold("background_bash"))} ${theme.fg("dim", oneLine(args.command, 120))}`, 0, 0);
+    },
+    renderResult(result, _options, theme) {
+      const job = isJobRecord(result.details) ? result.details : undefined;
+      if (!job) return new Text(result.content[0]?.type === "text" ? result.content[0].text : "Started background job", 0, 0);
+      return new Text(`${formatJobLineStyled(job, theme)}\n${theme.fg("dim", `Full output: ${job.outputPath}`)}`, 0, 0);
     },
   });
 
@@ -665,6 +768,20 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: renderJobMessage(job) }], details: job };
       }
       return { content: [{ type: "text", text: `Started subagent ${job.id} pid:${job.pid ?? "pending"}\nUse job_status/job_output/job_stop with id ${job.id}.` }], details: job };
+    },
+    renderCall(args, theme) {
+      const agent = args.agent ?? "general";
+      const mode = args.wait ? "foreground" : "background";
+      return new Text(
+        `${theme.fg("toolTitle", theme.bold("subagent_start"))} ${theme.fg("warning", agent)} ${theme.fg("dim", `(${mode})`)}\n${theme.fg("dim", oneLine(args.prompt, 180))}`,
+        0,
+        0,
+      );
+    },
+    renderResult(result, _options, theme) {
+      const job = isJobRecord(result.details) ? result.details : undefined;
+      if (!job) return new Text(result.content[0]?.type === "text" ? result.content[0].text : "Started subagent", 0, 0);
+      return new Text(`${formatJobLineStyled(job, theme)}\n${theme.fg("dim", `Prompt: ${oneLine(job.prompt ?? "", 180)}`)}`, 0, 0);
     },
   });
 

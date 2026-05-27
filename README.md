@@ -13,6 +13,7 @@ This package starts with a practical background job manager for Pi:
 - per-session registries under `~/.pi/agent/background-jobs/workspaces/<session-id>/`
 - subagent sessions stored separately from normal Pi `/resume` sessions
 - bottom widget showing running/done/error jobs
+- completion notifications that wake the main agent with a compact summary + full output path
 
 Install locally while developing:
 
