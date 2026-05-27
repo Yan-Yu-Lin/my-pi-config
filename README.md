@@ -10,7 +10,8 @@ This package starts with a practical background job manager for Pi:
 - start/resume/stop subagents as managed jobs
 - stable IDs like `sh_001` and `sa_001`
 - PID tracking while jobs are running
-- persistent registry under `~/.pi/agent/background-jobs/`
+- per-session registries under `~/.pi/agent/background-jobs/workspaces/<session-id>/`
+- subagent sessions stored separately from normal Pi `/resume` sessions
 - bottom widget showing running/done/error jobs
 
 Install locally while developing:

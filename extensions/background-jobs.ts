@@ -1,8 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { access, readFile, readdir, unlink, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
   getAgentDir,
@@ -16,7 +16,7 @@ import { Type } from "typebox";
 type JobKind = "bash" | "subagent";
 type JobStatus = "starting" | "running" | "done" | "error" | "aborted";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
-type JobSource = "user" | "project";
+type JobSource = "package" | "user" | "project";
 
 type JobRecord = {
   id: string;
@@ -44,6 +44,11 @@ type JobRecord = {
 type Registry = {
   next: Record<string, number>;
   jobs: JobRecord[];
+  workspaceId: string;
+  workspaceDir: string;
+  logDir: string;
+  registryPath: string;
+  subagentSessionDir: string;
 };
 
 type AgentDefinition = {
@@ -68,14 +73,33 @@ const EXTENSION_TOOLS = new Set([
   "job_stop",
 ]);
 const DEFAULT_SUBAGENT_TOOLS = ["read", "grep", "find", "ls", "bash", "edit", "write"];
-const JOB_DIR = join(getAgentDir(), "background-jobs");
-const LOG_DIR = join(JOB_DIR, "logs");
-const REGISTRY_PATH = join(JOB_DIR, "registry.json");
+const BASE_JOB_DIR = join(getAgentDir(), "background-jobs");
 const PROJECT_AGENT_DIR = ".pi/subagents";
 const USER_AGENT_DIR = join(getAgentDir(), "subagents");
+const PACKAGE_AGENT_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "subagents");
 
-function ensureDirs() {
-  mkdirSync(LOG_DIR, { recursive: true });
+function sanitizeWorkspaceId(id: string) {
+  return id.replace(/[^a-zA-Z0-9_.-]/g, "_");
+}
+
+function getWorkspaceId(ctx: ExtensionContext) {
+  return sanitizeWorkspaceId(ctx.sessionManager.getSessionId() || "global");
+}
+
+function registryPaths(workspaceId: string) {
+  const workspaceDir = join(BASE_JOB_DIR, "workspaces", sanitizeWorkspaceId(workspaceId));
+  return {
+    workspaceId: sanitizeWorkspaceId(workspaceId),
+    workspaceDir,
+    logDir: join(workspaceDir, "logs"),
+    registryPath: join(workspaceDir, "registry.json"),
+    subagentSessionDir: join(workspaceDir, "subagent-sessions"),
+  };
+}
+
+function ensureDirs(registry: Pick<Registry, "logDir" | "subagentSessionDir">) {
+  mkdirSync(registry.logDir, { recursive: true });
+  mkdirSync(registry.subagentSessionDir, { recursive: true });
 }
 
 function now() {
@@ -95,23 +119,28 @@ function normalizeTools(tools: string[] | undefined) {
   return [...new Set(input.map((tool) => tool.trim()).filter(Boolean))].filter((tool) => !EXTENSION_TOOLS.has(tool));
 }
 
-function loadRegistry(): Registry {
-  ensureDirs();
-  if (!existsSync(REGISTRY_PATH)) return { next: { sh: 1, sa: 1 }, jobs: [] };
+function emptyRegistry(workspaceId: string): Registry {
+  const paths = registryPaths(workspaceId);
+  return { next: { sh: 1, sa: 1 }, jobs: [], ...paths };
+}
+
+function loadRegistry(workspaceId: string): Registry {
+  const registry = emptyRegistry(workspaceId);
+  ensureDirs(registry);
+  if (!existsSync(registry.registryPath)) return registry;
   try {
-    const parsed = JSON.parse(readFileSync(REGISTRY_PATH, "utf8")) as Partial<Registry>;
-    return {
-      next: { sh: parsed.next?.sh ?? 1, sa: parsed.next?.sa ?? 1 },
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [],
-    };
+    const parsed = JSON.parse(readFileSync(registry.registryPath, "utf8")) as Partial<Pick<Registry, "next" | "jobs">>;
+    registry.next = { sh: parsed.next?.sh ?? 1, sa: parsed.next?.sa ?? 1 };
+    registry.jobs = Array.isArray(parsed.jobs) ? parsed.jobs : [];
+    return registry;
   } catch {
-    return { next: { sh: 1, sa: 1 }, jobs: [] };
+    return registry;
   }
 }
 
 function saveRegistry(registry: Registry) {
-  ensureDirs();
-  writeFileSync(REGISTRY_PATH, `${JSON.stringify(registry, null, 2)}\n`, "utf8");
+  ensureDirs(registry);
+  writeFileSync(registry.registryPath, `${JSON.stringify({ next: registry.next, jobs: registry.jobs }, null, 2)}\n`, "utf8");
 }
 
 function createJob(registry: Registry, kind: JobKind, cwd: string): JobRecord {
@@ -127,7 +156,7 @@ function createJob(registry: Registry, kind: JobKind, cwd: string): JobRecord {
     cwd,
     createdAt,
     updatedAt: createdAt,
-    logPath: join(LOG_DIR, `${id}.log`),
+    logPath: join(registry.logDir, `${id}.log`),
   };
   registry.jobs.push(job);
   saveRegistry(registry);
@@ -175,7 +204,7 @@ function reconcileRunningJobs(registry: Registry) {
 }
 
 function appendLog(job: JobRecord, text: string) {
-  ensureDirs();
+  mkdirSync(dirname(job.logPath), { recursive: true });
   writeFileSync(job.logPath, text, { flag: "a", encoding: "utf8" });
 }
 
@@ -251,16 +280,18 @@ async function loadAgentsFromDir(dir: string, source: JobSource): Promise<AgentD
 }
 
 async function discoverAgents(cwd: string) {
+  const packageAgents = await loadAgentsFromDir(PACKAGE_AGENT_DIR, "package");
   const userAgents = await loadAgentsFromDir(USER_AGENT_DIR, "user");
   const projectAgents = await loadAgentsFromDir(resolve(cwd, PROJECT_AGENT_DIR), "project");
   const map = new Map<string, AgentDefinition>();
+  for (const agent of packageAgents) map.set(agent.name, agent);
   for (const agent of userAgents) map.set(agent.name, agent);
   for (const agent of projectAgents) map.set(agent.name, agent);
   return [...map.values()];
 }
 
-async function writeTempPrompt(id: string, prompt: string) {
-  const dir = join(JOB_DIR, "tmp");
+async function writeTempPrompt(registry: Registry, id: string, prompt: string) {
+  const dir = join(registry.workspaceDir, "tmp");
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${id}-system.md`);
   await writeFile(path, prompt, { encoding: "utf8", mode: 0o600 });
@@ -386,13 +417,23 @@ function startSubagentJob(
   });
   saveRegistry(registry);
 
-  const args = ["-p", "--mode", "json", ...buildModelArgs(model, thinking), "--tools", tools.join(",")];
+  ensureDirs(registry);
+  const args = [
+    "-p",
+    "--mode",
+    "json",
+    "--session-dir",
+    registry.subagentSessionDir,
+    ...buildModelArgs(model, thinking),
+    "--tools",
+    tools.join(","),
+  ];
   if (job.piSessionId || job.sessionFile) args.push("--session", job.sessionFile ?? job.piSessionId!);
 
   let tempSystemPath: string | undefined;
   const start = async () => {
     if (agent?.systemPrompt.trim()) {
-      tempSystemPath = await writeTempPrompt(job.id, agent.systemPrompt);
+      tempSystemPath = await writeTempPrompt(registry, job.id, agent.systemPrompt);
       args.push("--append-system-prompt", tempSystemPath);
     }
     args.push(prompt);
@@ -521,7 +562,7 @@ function renderJobMessage(job: JobRecord) {
 const ThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const);
 
 export default function (pi: ExtensionAPI) {
-  const registry = loadRegistry();
+  let registry = loadRegistry("global");
   reconcileRunningJobs(registry);
   let latestCtx: ExtensionContext | undefined;
 
@@ -542,6 +583,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    registry = loadRegistry(getWorkspaceId(ctx));
+    reconcileRunningJobs(registry);
     updateWidget(ctx, registry);
   });
 
