@@ -710,7 +710,14 @@ export default function (pi: ExtensionAPI) {
   pi.registerMessageRenderer("task-notification", (message, options, theme) => {
     const job = isJobRecord(message.details) ? message.details : undefined;
     if (!job) return new Text(messageContentText(message.content), 0, 0);
-    return new Text(renderTaskNotification(job, options.expanded, theme), 0, 0);
+
+    const bgToken = job.status === "done"
+      ? "toolSuccessBg"
+      : job.status === "running" || job.status === "starting"
+        ? "toolPendingBg"
+        : "toolErrorBg";
+
+    return new Text(renderTaskNotification(job, options.expanded, theme), 1, 1, (text) => theme.bg(bgToken, text));
   });
 
   pi.on("session_start", (_event, ctx) => {
