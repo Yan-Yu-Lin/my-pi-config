@@ -1,3 +1,8 @@
+---
+name: subagent-context-cultivation
+description: Guidance for using resumable subagents as peer AI contexts through warm-up, exploration, alignment, and multi-turn context building instead of one-shot task delegation. Use before starting or resuming subagents on complex work.
+---
+
 # Subagent Context Cultivation
 
 Use this skill when you are considering starting or resuming a subagent, especially for complex work where the subagent may need to build understanding over time rather than answer a one-shot prompt.
