@@ -699,7 +699,6 @@ export default function (pi: ExtensionAPI) {
   let latestCtx: ExtensionContext | undefined;
 
   reportJobCompletion = (job) => {
-    if (latestCtx?.hasUI) latestCtx.ui.notify(`${job.id} ${job.status}`, job.status === "done" ? "info" : "warning");
     pi.sendMessage({
       customType: "task-notification",
       content: buildTaskNotificationContent(job),
@@ -830,24 +829,33 @@ export default function (pi: ExtensionAPI) {
     renderResult(result, options, theme) {
       const job = isJobRecord(result.details) ? result.details : undefined;
       if (!job) return new Text(result.content[0]?.type === "text" ? result.content[0].text : "Started subagent", 0, 0);
-      if (!options.expanded) return new Text(`${formatJobLineStyled(job, theme)}\n${theme.fg("dim", `Prompt: ${oneLine(job.prompt ?? "", 180)}`)}`, 0, 0);
-      return new Text(
-        [
-          formatJobLineStyled(job, theme),
-          renderKeyValue(theme, "Agent", job.agent),
-          renderKeyValue(theme, "Model", job.model),
-          renderKeyValue(theme, "Thinking", job.thinking),
-          renderKeyValue(theme, "Tools", job.tools?.join(",")),
-          renderKeyValue(theme, "Cwd", job.cwd),
-          renderKeyValue(theme, "Full output", job.outputPath),
-          renderKeyValue(theme, "Log", job.logPath),
-          "",
-          theme.fg("muted", "Full prompt:"),
-          job.prompt ?? "",
-        ].filter((line): line is string => line !== undefined).join("\n"),
-        0,
-        0,
-      );
+
+      const isFinished = job.status === "done" || job.status === "error" || job.status === "aborted";
+      if (!options.expanded) {
+        const suffix = isFinished
+          ? theme.fg("dim", ` — ${oneLine(getJobSummary(job, 220), 180)}`)
+          : theme.fg("dim", `Output: ${job.outputPath}`);
+        return new Text(`${formatJobLineStyled(job, theme)}${suffix}`, 0, 0);
+      }
+
+      const detailLines: Array<string | undefined> = [
+        formatJobLineStyled(job, theme),
+        renderKeyValue(theme, "Agent", job.agent),
+        renderKeyValue(theme, "Model", job.model),
+        renderKeyValue(theme, "Thinking", job.thinking),
+        renderKeyValue(theme, "Tools", job.tools?.join(",")),
+        renderKeyValue(theme, "Cwd", job.cwd),
+        renderKeyValue(theme, "Output path", job.outputPath),
+        renderKeyValue(theme, "Log", job.logPath),
+      ];
+
+      if (isFinished) {
+        detailLines.push("", theme.fg("muted", "Full output:"), readFullJobOutput(job));
+      } else {
+        detailLines.push("", theme.fg("muted", "Full prompt:"), job.prompt ?? "");
+      }
+
+      return new Text(detailLines.filter((line): line is string => line !== undefined).join("\n"), 0, 0);
     },
   });
 
