@@ -216,6 +216,19 @@ function formatJobLine(job: JobRecord) {
   return `${icon} ${job.id} ${job.status} ${label}${pid}${session}`;
 }
 
+function isJobRecord(value: unknown): value is JobRecord {
+  return isRecord(value) && typeof value.id === "string" && (value.kind === "bash" || value.kind === "subagent");
+}
+
+function formatJobLineStyled(job: JobRecord, theme: ExtensionContext["ui"]["theme"]) {
+  const iconColor = job.status === "done" ? "success" : job.status === "running" || job.status === "starting" ? "warning" : "error";
+  const icon = job.status === "running" || job.status === "starting" ? "⏳" : job.status === "done" ? "✓" : "✗";
+  const label = job.kind === "subagent" ? job.agent ?? "subagent" : job.command ?? "bash";
+  const pid = job.pid ? theme.fg("dim", ` pid:${job.pid}`) : "";
+  const session = job.piSessionId ? theme.fg("dim", ` session:${job.piSessionId.slice(0, 8)}`) : "";
+  return `${theme.fg(iconColor, icon)} ${theme.fg("warning", job.id)} ${theme.fg(iconColor, job.status)} ${theme.fg("toolTitle", label)}${pid}${session}`;
+}
+
 function updateWidget(ctx: ExtensionContext, registry: Registry) {
   if (!ctx.hasUI) return;
   reconcileRunningJobs(registry);
@@ -225,7 +238,10 @@ function updateWidget(ctx: ExtensionContext, registry: Registry) {
     return;
   }
   const running = registry.jobs.filter((job) => job.status === "running" || job.status === "starting").length;
-  const lines = [`Background jobs: ${running} running · ${registry.jobs.length} total`, ...recent.map(formatJobLine)];
+  const lines = [
+    `${ctx.ui.theme.fg("warning", "Background jobs")}: ${running} running · ${registry.jobs.length} total`,
+    ...recent.map((job) => formatJobLineStyled(job, ctx.ui.theme)),
+  ];
   ctx.ui.setWidget("background-jobs", lines, { placement: "belowEditor" });
 }
 
@@ -578,7 +594,12 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.registerMessageRenderer("background-job", (message, _options, theme) => {
-    return new Text(theme.fg("accent", "Background job update") + "\n" + message.content, 0, 0);
+    const job = isJobRecord(message.details) ? message.details : undefined;
+    const title = theme.fg("warning", theme.bold("Background job update"));
+    if (!job) return new Text(`${title}\n${message.content}`, 0, 0);
+
+    const body = job.lastResult ? `\n\n${job.lastResult}` : job.lastError ? `\n\n${theme.fg("error", job.lastError)}` : "";
+    return new Text(`${title}\n${formatJobLineStyled(job, theme)}${body}`, 0, 0);
   });
 
   pi.on("session_start", (_event, ctx) => {
@@ -637,6 +658,7 @@ export default function (pi: ExtensionAPI) {
         thinking: params.thinking,
         tools: params.tools,
         cwd,
+        reportCompletion: params.wait ? false : true,
       });
       if (params.wait) {
         while (job.status === "starting" || job.status === "running") await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
@@ -671,6 +693,7 @@ export default function (pi: ExtensionAPI) {
         tools: job.tools,
         cwd: job.cwd,
         session: job.id,
+        reportCompletion: params.wait ? false : true,
       });
       if (params.wait) {
         while (resumed.status === "starting" || resumed.status === "running") await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
