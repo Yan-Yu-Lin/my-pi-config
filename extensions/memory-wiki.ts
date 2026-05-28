@@ -2,11 +2,14 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSyn
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import {
+  createReadToolDefinition,
   getAgentDir,
   isReadToolResult,
+  keyHint,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 
 type MemoryNote = {
   path: string;
@@ -40,6 +43,7 @@ type RuntimeState = {
 };
 
 const MEMORY_VAULTS = ["/Users/linyanyu/.claude/projects/-Users-linyanyu/memory"];
+const VAULT_LABELS = new Map([[canonicalize(MEMORY_VAULTS[0]!), "Global"]]);
 const BASE_DIR = join(getAgentDir(), "memory-wiki");
 const MAX_SECTION_ITEMS = 16;
 
@@ -261,6 +265,18 @@ function findIndexForPath(indexes: VaultIndex[], path: string) {
   return indexes.find((index) => index.notes.has(canonical));
 }
 
+function findMemoryNote(indexes: VaultIndex[], cwd: string, inputPath: string) {
+  const absolutePath = normalizeInputPath(cwd, inputPath);
+  const index = findIndexForPath(indexes, absolutePath);
+  const note = index?.notes.get(absolutePath);
+  if (!index || !note) return undefined;
+  return { index, note };
+}
+
+function vaultLabel(index: VaultIndex) {
+  return VAULT_LABELS.get(index.vault) ?? displayName(index.vault, index.vault) ?? "Memory";
+}
+
 function formatNote(note: MemoryNote, includeDescription: boolean) {
   if (includeDescription && note.description) return `${note.displayName} — ${note.description}`;
   return note.displayName;
@@ -380,9 +396,117 @@ function appendContextToContent(content: (TextContent | ImageContent)[], context
   ];
 }
 
+function textContent(content: string | (TextContent | ImageContent)[]) {
+  if (typeof content === "string") return content;
+  return content
+    .map((part) => (part.type === "text" ? part.text : "[image]"))
+    .join("\n");
+}
+
+function splitMemoryReminder(content: (TextContent | ImageContent)[]) {
+  const textBlocks = content.filter((part): part is TextContent => part.type === "text");
+  const combined = textBlocks.map((part) => part.text).join("\n");
+  const match = /<memory-wiki-context[^>]*>([\s\S]*?)<\/memory-wiki-context>/.exec(combined);
+  if (!match) {
+    return {
+      fileText: combined,
+      reminder: undefined,
+      outboundCount: 0,
+      inboundCount: 0,
+    };
+  }
+
+  const reminder = match[1]!.trim();
+  const fileText = combined.replace(match[0], "").trimEnd();
+  const outboundSection = /Outbound link descriptions not already shown:\n([\s\S]*?)(?:\n\nInbound backlinks|$)/.exec(reminder)?.[1] ?? "";
+  const inboundSection = /Inbound backlinks \(other memory files related to this file\):\n([\s\S]*)$/.exec(reminder)?.[1] ?? "";
+  const countItems = (section: string) => section.split(/\r?\n/).filter((line) => line.startsWith("- ")).length;
+
+  return {
+    fileText,
+    reminder,
+    outboundCount: countItems(outboundSection),
+    inboundCount: countItems(inboundSection),
+  };
+}
+
+function oneLine(text: string, max = 160) {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  return collapsed.length > max ? `${collapsed.slice(0, max - 1)}…` : collapsed;
+}
+
+function memorySummary(outboundCount: number, inboundCount: number) {
+  const parts: string[] = [];
+  if (outboundCount > 0) parts.push(`${outboundCount} outbound description${outboundCount === 1 ? "" : "s"}`);
+  if (inboundCount > 0) parts.push(`${inboundCount} inbound backlink${inboundCount === 1 ? "" : "s"}`);
+  return parts.length > 0 ? parts.join(" · ") : "no new reminders";
+}
+
 export default function (pi: ExtensionAPI) {
   let indexes = buildIndexes();
   let runtime: RuntimeState | undefined;
+
+  pi.registerMessageRenderer("memory-wiki-bootstrap", (message, { expanded }, theme) => {
+    const content = textContent(message.content);
+    const hint = keyHint("app.tools.expand", "to expand");
+    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+    if (!expanded) {
+      box.addChild(new Text(`${theme.fg("customMessageLabel", theme.bold("memory wiki"))} ${theme.fg("muted", "bootstrap injected")} ${theme.fg("dim", `(${hint})`)}`, 0, 0));
+      return box;
+    }
+    box.addChild(new Text(`${theme.fg("customMessageLabel", theme.bold("memory wiki bootstrap"))}\n\n${content}`, 0, 0));
+    return box;
+  });
+
+  const baseRead = createReadToolDefinition(process.cwd());
+  pi.registerTool({
+    ...baseRead,
+    renderShell: "self",
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const read = createReadToolDefinition(ctx.cwd);
+      return read.execute(toolCallId, params, signal, onUpdate, ctx);
+    },
+    renderCall(args, theme, context) {
+      const memory = findMemoryNote(indexes, context.cwd, args.path);
+      if (!memory) return baseRead.renderCall?.(args, theme, context) ?? new Text(`${theme.fg("toolTitle", "read")} ${args.path}`, 0, 0);
+
+      const label = `${vaultLabel(memory.index)}/${memory.note.displayName}.md`;
+      const text = `${theme.fg("customMessageLabel", theme.bold("recall memory"))} ${theme.fg("accent", label)}`;
+      return new Text(text, 1, 0, (line) => theme.bg("customMessageBg", line));
+    },
+    renderResult(result, options, theme, context) {
+      const memory = findMemoryNote(indexes, context.cwd, context.args.path);
+      if (!memory) {
+        if (options.isPartial) return new Text(theme.fg("warning", "Reading..."), 0, 0);
+        const firstText = result.content.find((part) => part.type === "text")?.text;
+        const firstImage = result.content.find((part) => part.type === "image");
+        if (firstImage) return new Text(theme.fg("success", "Image loaded"), 0, 0);
+        if (!firstText) return new Text(theme.fg("error", "No content"), 0, 0);
+        const lineCount = firstText.split("\n").length;
+        if (!options.expanded) return new Text(theme.fg("success", `${lineCount} lines`), 0, 0);
+        return new Text(`${theme.fg("success", `${lineCount} lines`)}\n${firstText}`, 0, 0);
+      }
+
+      if (options.isPartial) return new Text(theme.fg("customMessageLabel", "[memory] recalling..."), 0, 0);
+      if (context.isError) {
+        const firstText = result.content.find((part) => part.type === "text")?.text ?? "read failed";
+        return new Text(theme.fg("error", `[memory] ${oneLine(firstText)}`), 0, 0);
+      }
+
+      const { fileText, reminder, outboundCount, inboundCount } = splitMemoryReminder(result.content);
+      const summary = memorySummary(outboundCount, inboundCount);
+      if (!options.expanded) {
+        return new Text(theme.fg("customMessageLabel", `[reminder] ${summary}`), 0, 0);
+      }
+
+      const lines = [
+        theme.fg("customMessageLabel", `[reminder] ${summary}`),
+        reminder ? `\n${theme.fg("customMessageLabel", reminder)}` : undefined,
+        fileText ? `\n${theme.fg("muted", "Recalled file content:")}\n${fileText}` : undefined,
+      ].filter((line): line is string => Boolean(line));
+      return new Text(lines.join("\n"), 0, 0);
+    },
+  });
 
   pi.on("session_start", (_event, ctx) => {
     runtime = loadRuntime(ctx);
