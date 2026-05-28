@@ -442,15 +442,18 @@ function memorySummary(outboundCount: number, inboundCount: number) {
   return parts.length > 0 ? parts.join(" · ") : "no new reminders";
 }
 
-function memoryCard(lines: string[], theme: ExtensionContext["ui"]["theme"], options: { top?: number; bottom?: number } = {}): Component {
+type CardBg = "customMessageBg" | "toolPendingBg" | "toolSuccessBg" | "toolErrorBg";
+
+function memoryCard(lines: string[], theme: ExtensionContext["ui"]["theme"], options: { top?: number; bottom?: number; bg?: CardBg } = {}): Component {
   const top = options.top ?? 0;
   const bottom = options.bottom ?? 0;
+  const bg = options.bg ?? "customMessageBg";
   return {
     invalidate() {},
     render(width: number) {
       const paint = (line: string) => {
         const padding = Math.max(0, width - visibleWidth(line));
-        return theme.bg("customMessageBg", line + " ".repeat(padding));
+        return theme.bg(bg, line + " ".repeat(padding));
       };
       const rendered: string[] = [];
       for (let i = 0; i < top; i++) rendered.push(paint(""));
@@ -468,6 +471,11 @@ function memoryCard(lines: string[], theme: ExtensionContext["ui"]["theme"], opt
       return rendered;
     },
   };
+}
+
+function toolBg(context: { isPartial: boolean; isError: boolean }): CardBg {
+  if (context.isPartial) return "toolPendingBg";
+  return context.isError ? "toolErrorBg" : "toolSuccessBg";
 }
 
 export default function (pi: ExtensionAPI) {
@@ -496,7 +504,16 @@ export default function (pi: ExtensionAPI) {
     },
     renderCall(args, theme, context) {
       const memory = findMemoryNote(indexes, context.cwd, args.path);
-      if (!memory) return baseRead.renderCall?.(args, theme, context) ?? new Text(`${theme.fg("toolTitle", "read")} ${args.path}`, 0, 0);
+      if (!memory) {
+        const parts = [theme.fg("toolTitle", theme.bold("read ")) + theme.fg("accent", args.path)];
+        if (args.offset || args.limit) {
+          const opts: string[] = [];
+          if (args.offset) opts.push(`offset=${args.offset}`);
+          if (args.limit) opts.push(`limit=${args.limit}`);
+          parts[0] += theme.fg("dim", ` (${opts.join(", ")})`);
+        }
+        return memoryCard(parts, theme, { top: 1, bg: toolBg(context) });
+      }
 
       const label = `${vaultLabel(memory.index)}/${memory.note.displayName}.md`;
       const text = `${theme.fg("customMessageLabel", theme.bold("recall memory"))} ${theme.fg("accent", label)}`;
@@ -505,14 +522,15 @@ export default function (pi: ExtensionAPI) {
     renderResult(result, options, theme, context) {
       const memory = findMemoryNote(indexes, context.cwd, context.args.path);
       if (!memory) {
-        if (options.isPartial) return new Text(theme.fg("warning", "Reading..."), 0, 0);
+        if (options.isPartial) return memoryCard([theme.fg("warning", "Reading...")], theme, { bottom: 1, bg: "toolPendingBg" });
         const firstText = result.content.find((part) => part.type === "text")?.text;
         const firstImage = result.content.find((part) => part.type === "image");
-        if (firstImage) return new Text(theme.fg("success", "Image loaded"), 0, 0);
-        if (!firstText) return new Text(theme.fg("error", "No content"), 0, 0);
+        if (firstImage) return memoryCard([theme.fg("success", "Image loaded")], theme, { bottom: 1, bg: toolBg(context) });
+        if (!firstText) return memoryCard([theme.fg("error", "No content")], theme, { bottom: 1, bg: toolBg(context) });
         const lineCount = firstText.split("\n").length;
-        if (!options.expanded) return new Text(theme.fg("success", `${lineCount} lines`), 0, 0);
-        return new Text(`${theme.fg("success", `${lineCount} lines`)}\n${firstText}`, 0, 0);
+        const lines = [theme.fg("success", `${lineCount} lines`)];
+        if (options.expanded) lines.push("", ...firstText.split(/\r?\n/));
+        return memoryCard(lines, theme, { bottom: 1, bg: toolBg(context) });
       }
 
       if (options.isPartial) return memoryCard([theme.fg("customMessageLabel", "[memory] recalling...")], theme, { bottom: 1 });
