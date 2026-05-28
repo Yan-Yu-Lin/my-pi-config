@@ -9,7 +9,7 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Box, Text } from "@earendil-works/pi-tui";
+import { Box, type Component, Text, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 type MemoryNote = {
   path: string;
@@ -442,6 +442,34 @@ function memorySummary(outboundCount: number, inboundCount: number) {
   return parts.length > 0 ? parts.join(" · ") : "no new reminders";
 }
 
+function memoryCard(lines: string[], theme: ExtensionContext["ui"]["theme"], options: { top?: number; bottom?: number } = {}): Component {
+  const top = options.top ?? 0;
+  const bottom = options.bottom ?? 0;
+  return {
+    invalidate() {},
+    render(width: number) {
+      const paint = (line: string) => {
+        const padding = Math.max(0, width - visibleWidth(line));
+        return theme.bg("customMessageBg", line + " ".repeat(padding));
+      };
+      const rendered: string[] = [];
+      for (let i = 0; i < top; i++) rendered.push(paint(""));
+      const contentWidth = Math.max(1, width - 2);
+      for (const line of lines) {
+        if (line === "") {
+          rendered.push(paint(""));
+          continue;
+        }
+        for (const wrapped of wrapTextWithAnsi(line, contentWidth)) {
+          rendered.push(paint(` ${wrapped} `));
+        }
+      }
+      for (let i = 0; i < bottom; i++) rendered.push(paint(""));
+      return rendered;
+    },
+  };
+}
+
 export default function (pi: ExtensionAPI) {
   let indexes = buildIndexes();
   let runtime: RuntimeState | undefined;
@@ -472,7 +500,7 @@ export default function (pi: ExtensionAPI) {
 
       const label = `${vaultLabel(memory.index)}/${memory.note.displayName}.md`;
       const text = `${theme.fg("customMessageLabel", theme.bold("recall memory"))} ${theme.fg("accent", label)}`;
-      return new Text(text, 1, 0, (line) => theme.bg("customMessageBg", line));
+      return memoryCard([text], theme, { top: 1 });
     },
     renderResult(result, options, theme, context) {
       const memory = findMemoryNote(indexes, context.cwd, context.args.path);
@@ -487,24 +515,28 @@ export default function (pi: ExtensionAPI) {
         return new Text(`${theme.fg("success", `${lineCount} lines`)}\n${firstText}`, 0, 0);
       }
 
-      if (options.isPartial) return new Text(theme.fg("customMessageLabel", "[memory] recalling..."), 0, 0);
+      if (options.isPartial) return memoryCard([theme.fg("customMessageLabel", "[memory] recalling...")], theme, { bottom: 1 });
       if (context.isError) {
         const firstText = result.content.find((part) => part.type === "text")?.text ?? "read failed";
-        return new Text(theme.fg("error", `[memory] ${oneLine(firstText)}`), 0, 0);
+        return memoryCard([theme.fg("error", `[memory] ${oneLine(firstText)}`)], theme, { bottom: 1 });
       }
 
       const { fileText, reminder, outboundCount, inboundCount } = splitMemoryReminder(result.content);
       const summary = memorySummary(outboundCount, inboundCount);
       if (!options.expanded) {
-        return new Text(theme.fg("customMessageLabel", `[reminder] ${summary}`), 0, 0);
+        return memoryCard([theme.fg("customMessageLabel", `[reminder] ${summary}`)], theme, { bottom: 1 });
       }
 
       const lines = [
+        theme.fg("customMessageLabel", theme.bold("recalled file content")),
+        "",
+        ...(fileText ? fileText.split(/\r?\n/) : [theme.fg("dim", "(no text content)")]),
+        "",
+        theme.fg("customMessageLabel", theme.bold("memory reminders")),
         theme.fg("customMessageLabel", `[reminder] ${summary}`),
-        reminder ? `\n${theme.fg("customMessageLabel", reminder)}` : undefined,
-        fileText ? `\n${theme.fg("muted", "Recalled file content:")}\n${fileText}` : undefined,
-      ].filter((line): line is string => Boolean(line));
-      return new Text(lines.join("\n"), 0, 0);
+        ...(reminder ? ["", ...reminder.split(/\r?\n/).map((line) => theme.fg("customMessageLabel", line))] : []),
+      ];
+      return memoryCard(lines, theme, { bottom: 1 });
     },
   });
 
